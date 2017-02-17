@@ -1,3 +1,4 @@
+#![recursion_limit = "1024"]
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_proto;
@@ -88,16 +89,11 @@ impl std::fmt::Display for BeanstalkCommand {
       Use(ref tube) => write!(f, "use {}\r\n", tube),
       Reserve(opt_timeout) => {
         write!(f,
-               "{}{}\r\n",
-               if let Some(_) = opt_timeout {
-                 "reserve-with-timeout "
+               "{}\r\n",
+               if opt_timeout.is_some() {
+                 format!("reserve-with-timeout {}", opt_timeout.unwrap())
                } else {
-                 "reserve"
-               },
-               if let Some(timeout) = opt_timeout {
-                 timeout.to_string()
-               } else {
-                 String::new()
+                 String::from("reserve")
                })
       }
       Delete(id) => write!(f, "delete {}\r\n", id),
@@ -260,7 +256,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::name())
       .skip(crlf())
-      .map(|name| BeanstalkCommand::Use(name));
+      .map(BeanstalkCommand::Use);
 
     use_parser.parse_stream(input)
   }
@@ -303,7 +299,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|id| BeanstalkCommand::Delete(id));
+      .map(BeanstalkCommand::Delete);
 
     delete.parse_stream(input)
   }
@@ -354,7 +350,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|id| BeanstalkCommand::Touch(id));
+      .map(BeanstalkCommand::Touch);
 
     touch.parse_stream(input)
   }
@@ -369,7 +365,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::name())
       .skip(crlf())
-      .map(|name| BeanstalkCommand::Watch(name));
+      .map(BeanstalkCommand::Watch);
 
     watch.parse_stream(input)
   }
@@ -384,7 +380,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::name())
       .skip(crlf())
-      .map(|name| BeanstalkCommand::Ignore(name));
+      .map(BeanstalkCommand::Ignore);
 
     ignore.parse_stream(input)
   }
@@ -399,7 +395,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|id| BeanstalkCommand::Peek(id));
+      .map(BeanstalkCommand::Peek);
 
     peek.parse_stream(input)
   }
@@ -440,7 +436,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|bound| BeanstalkCommand::Kick(bound));
+      .map(BeanstalkCommand::Kick);
 
     kick.parse_stream(input)
   }
@@ -455,7 +451,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|id| BeanstalkCommand::KickJob(id));
+      .map(BeanstalkCommand::KickJob);
 
     kick_job.parse_stream(input)
   }
@@ -470,7 +466,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|id| BeanstalkCommand::StatsJob(id));
+      .map(BeanstalkCommand::StatsJob);
 
     stats_job.parse_stream(input)
   }
@@ -485,7 +481,7 @@ impl<'a, I> Beanstalk<I>
       .skip(byte(b' '))
       .with(Beanstalk::number())
       .skip(crlf())
-      .map(|id| BeanstalkCommand::StatsTube(id));
+      .map(BeanstalkCommand::StatsTube);
 
     stats_tube.parse_stream(input)
   }
