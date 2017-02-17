@@ -99,11 +99,11 @@ impl std::fmt::Display for BeanstalkCommand {
       Watch(ref tube) => write!(f, "watch {}\r\n", tube),
       Ignore(ref tube) => write!(f, "ignore {}\r\n", tube),
       Peek(id) => write!(f, "peek {}\r\n", id),
-      PeekReady(id) => write!(f, "peek-ready\r\n", id),
-      PeekDelayed(id) => write!(f, "peek-delayed\r\n", id),
-      PeekBuried(id) => write!(f, "peek-buried\r\n", id),
-      Kick(bound) => write!(f, "kick {}\r\n", bound)
-      KickJob(id) => write!(f, "kick-job {}\r\n", id)
+      PeekReady => write!(f, "peek-ready\r\n"),
+      PeekDelayed => write!(f, "peek-delayed\r\n"),
+      PeekBuried => write!(f, "peek-buried\r\n"),
+      Kick(bound) => write!(f, "kick {}\r\n", bound),
+      KickJob(id) => write!(f, "kick-job {}\r\n", id),
       StatsJob(id) => write!(f, "stats-job {}\r\n", id)
     }
   }
@@ -237,9 +237,9 @@ impl Codec for LineCodec {
       .skip(byte(b' '))
       .and(many::<Vec<_>, _>(digit()).map(|ds| String::from_utf8(ds).unwrap()))
       .skip(crlf())
-      .map(|id| {
+      .map(|(id, priority)| {
         BeanstalkCommand::Bury(usize::from_str_radix(&id, 10).unwrap(),
-                               usize::from_str_radix(&bury, 10).unwrap())
+                               usize::from_str_radix(&priority, 10).unwrap())
       });
 
     // touch <id>\r\n
@@ -262,7 +262,7 @@ impl Codec for LineCodec {
       .map(|_| BeanstalkCommand::Ignore(String::new()));
 
     // peek <id>\r\n
-    let ignore = bytes(b"peek")
+    let peek = bytes(b"peek")
       .skip(byte(b' '))
       .with(many::<Vec<_>, _>(digit()).map(|ds| String::from_utf8(ds).unwrap()))
       .skip(crlf())
@@ -279,7 +279,7 @@ impl Codec for LineCodec {
       .map(|_| BeanstalkCommand::PeekDelayed);
 
     // kick <bound>\r\n
-    let ignore = bytes(b"kick")
+    let kick = bytes(b"kick")
       .skip(byte(b' '))
       .with(many::<Vec<_>, _>(digit()).map(|ds| String::from_utf8(ds).unwrap()))
       .skip(crlf())
@@ -293,7 +293,7 @@ impl Codec for LineCodec {
       .map(|id| BeanstalkCommand::KickJob(usize::from_str_radix(&id, 10).unwrap()));
 
     // stats-job <id>\r\n
-    let kick_job = bytes(b"stats-job")
+    let stats_job = bytes(b"stats-job")
       .skip(byte(b' '))
       .with(many::<Vec<_>, _>(digit()).map(|ds| String::from_utf8(ds).unwrap()))
       .skip(crlf())

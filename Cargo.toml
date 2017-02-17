@@ -1,5 +1,5 @@
 [package]
-name = "beanstalkd"
+name = "rust-beanstalkd"
 version = "0.1.0"
 authors = ["Nicholas Dujay <nickdujay@gmail.com>"]
 
