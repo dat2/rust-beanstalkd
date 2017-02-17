@@ -49,27 +49,38 @@ impl std::fmt::Display for BeanstalkError {
   }
 }
 
+impl From<BeanstalkError> for Vec<u8> {
+  fn from(error: BeanstalkError) -> Vec<u8> {
+    error.to_string().into_bytes()
+  }
+}
+
 #[derive(Debug)]
 pub enum BeanstalkCommand {
-  Put(usize, usize, usize, usize, Vec<u8>),
+  Put(u32, u32, u32, u32, Vec<u8>),
   Use(String),
-  Reserve(Option<usize>),
-  Delete(usize),
-  Release(usize, usize, usize),
-  Bury(usize, usize),
-  Touch(usize),
+  Reserve(Option<u32>),
+  Delete(u32),
+  Release(u32, u32, u32),
+  Bury(u32, u32),
+  Touch(u32),
   Watch(String),
   Ignore(String),
-  Peek(usize),
+  Peek(u32),
   PeekReady,
   PeekDelayed,
   PeekBuried,
-  Kick(usize),
-  KickJob(usize),
-  StatsJob(usize),
-  StatsTube(usize),
+  Kick(u32),
+  KickJob(u32),
+  StatsJob(u32),
+  StatsTube(String),
   Stats,
-  ListTubes
+  ListTubes,
+  ListTubeUsed,
+  ListTubesWatched,
+  Quit,
+  PauseTube(String, u32),
+  Unknown,
 }
 
 impl std::fmt::Display for BeanstalkCommand {
@@ -105,33 +116,97 @@ impl std::fmt::Display for BeanstalkCommand {
       Peek(id) => write!(f, "peek {}\r\n", id),
       PeekReady => write!(f, "peek-ready\r\n"),
       PeekDelayed => write!(f, "peek-delayed\r\n"),
-      PeekBuried => write!(f, "peek-buried\r\n"),
+      PeekBuried => write!(f, "peek-buried\r\n"), // doesn't seem to work
       Kick(bound) => write!(f, "kick {}\r\n", bound),
       KickJob(id) => write!(f, "kick-job {}\r\n", id),
       StatsJob(id) => write!(f, "stats-job {}\r\n", id),
-      StatsTube(id) => write!(f, "stats-tube {}\r\n", id),
+      StatsTube(ref tube) => write!(f, "stats-tube {}\r\n", tube),
       Stats => write!(f, "stats\r\n"),
       ListTubes => write!(f, "list-tubes\r\n"),
+      ListTubeUsed => write!(f, "list-tube-used\r\n"),
+      ListTubesWatched => write!(f, "list-tubes-watched\r\n"),
+      Quit => write!(f, "quit\r\n"),
+      PauseTube(ref tube, delay) => write!(f, "pause-tube {} {}\r\n", tube, delay),
+      Unknown => write!(f, "<unknown>\r\n"),
     }
   }
 }
 
 pub enum BeanstalkReply {
-  Inserted(usize),
-  Buried(Option<usize>),
+  Inserted(u32),
+  Buried(Option<u32>),
   Using(String),
-  Reserved(usize, Vec<u8>),
+  Reserved(u32, Vec<u8>),
   DeadlineSoon,
   TimedOut,
   Deleted,
   NotFound,
   Released,
   Touched,
-  Watching(usize),
+  Watching(u32),
   NotIgnored,
-  Found(usize, Vec<u8>),
-  Kicked(Option<usize>),
+  Found(u32, Vec<u8>),
+  Kicked(Option<u32>),
   Ok(Vec<u8>),
+  Paused,
+  Error(BeanstalkError),
+}
+
+impl std::convert::From<BeanstalkReply> for Vec<u8> {
+  fn from(reply: BeanstalkReply) -> Vec<u8> {
+    use BeanstalkReply::*;
+
+    match reply {
+      Inserted(id) => format!("INSERTED {}\r\n", id).into_bytes(),
+      Buried(id) => {
+        format!("BURIED{}\r\n",
+                if let Some(i) = id {
+                  format!(" {}", i)
+                } else {
+                  String::new()
+                })
+          .into_bytes()
+      }
+      Using(tube) => format!("USING {}\r\n", tube).into_bytes(),
+      Reserved(id, job) => {
+        let mut bytes = format!("RESERVED {} {}\r\n", id, job.len()).into_bytes();
+        bytes.extend_from_slice(&job);
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+      }
+      DeadlineSoon => format!("DEADLINE_SOON\r\n").into_bytes(),
+      TimedOut => format!("TIMED_OUT\r\n").into_bytes(),
+      Deleted => format!("DELETED\r\n").into_bytes(),
+      NotFound => format!("NOT_FOUND\r\n").into_bytes(),
+      Released => format!("RELEASED\r\n").into_bytes(),
+      Touched => format!("TOUCHED\r\n").into_bytes(),
+      Watching(count) => format!("WATCHING {}\r\n", count).into_bytes(),
+      NotIgnored => format!("NOT_IGNORED\r\n").into_bytes(),
+      Found(id, job) => {
+        let mut bytes = format!("FOUND {} {}\r\n", id, job.len()).into_bytes();
+        bytes.extend_from_slice(&job);
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+      }
+      Kicked(bound) => {
+        format!("KICKED{}\r\n",
+                if let Some(b) = bound {
+                  format!(" {}", b)
+                } else {
+                  String::new()
+                })
+          .into_bytes()
+      }
+      Ok(job) => {
+        let mut bytes = format!("OK {}\r\n", job.len()).into_bytes();
+        bytes.extend_from_slice(&job);
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+      }
+      Paused => format!("PAUSED\r\n").into_bytes(),
+      Error(e) => e.into(),
+    }
+  }
 }
 
 impl std::fmt::Display for BeanstalkReply {
@@ -164,12 +239,14 @@ impl std::fmt::Display for BeanstalkReply {
         write!(f,
                "KICKED{}\r\n",
                if let Some(b) = bound {
-                 format!("{} ", b)
+                 format!(" {}", b)
                } else {
                  String::new()
                })
       }
       Ok(ref data) => write!(f, "OK {}\r\n{}\r\n", data.len(), ""),
+      Paused => write!(f, "PAUSED\r\n"),
+      Error(ref e) => write!(f, "{}", e),
     }
   }
 }
@@ -180,13 +257,13 @@ pub struct Beanstalk<I>(PhantomData<fn(I) -> I>);
 type BeanstalkParser<O, I> = FnParser<I, fn(I) -> ParseResult<O, I>>;
 
 fn fn_parser<O, I>(f: fn(I) -> ParseResult<O, I>) -> BeanstalkParser<O, I>
-  where I: Stream<Item=u8>
+  where I: Stream<Item = u8>
 {
   parser(f)
 }
 
 impl<'a, I> Beanstalk<I>
-  where I: Stream<Item=u8, Range=&'a [u8]>
+  where I: Stream<Item = u8, Range = &'a [u8]>
 {
   fn name() -> BeanstalkParser<String, I> {
     fn_parser(Beanstalk::<I>::name_)
@@ -209,14 +286,14 @@ impl<'a, I> Beanstalk<I>
       .parse_stream(input)
   }
 
-  fn number() -> BeanstalkParser<usize, I> {
+  fn number() -> BeanstalkParser<u32, I> {
     fn_parser(Beanstalk::<I>::number_)
   }
 
-  fn number_(input: I) -> ParseResult<usize, I> {
+  fn number_(input: I) -> ParseResult<u32, I> {
     let mut parser = many::<Vec<_>, _>(digit())
       .map(|ds| String::from_utf8(ds).unwrap())
-      .map(|digits| usize::from_str_radix(&digits, 10).unwrap());
+      .map(|digits| u32::from_str_radix(&digits, 10).unwrap());
 
     parser.parse_stream(input)
   }
@@ -476,10 +553,10 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn stats_tube_(input: I) -> ParseResult<BeanstalkCommand, I> {
-    // stats-job <id>\r\n
+    // stats-tube <tube>\r\n
     let mut stats_tube = bytes(b"stats-tube")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(Beanstalk::name())
       .skip(crlf())
       .map(BeanstalkCommand::StatsTube);
 
@@ -491,10 +568,8 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn stats_(input: I) -> ParseResult<BeanstalkCommand, I> {
-    // stats-job <id>\r\n
+    // stats\r\n
     let mut stats = bytes(b"stats")
-      .skip(byte(b' '))
-      .with(Beanstalk::number())
       .skip(crlf())
       .map(|_| BeanstalkCommand::Stats);
 
@@ -506,14 +581,68 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn list_tubes_(input: I) -> ParseResult<BeanstalkCommand, I> {
-    // list_tubes-job <id>\r\n
+    // list-tubes <id>\r\n
     let mut list_tubes = bytes(b"list-tubes")
-      .skip(byte(b' '))
-      .with(Beanstalk::number())
       .skip(crlf())
       .map(|_| BeanstalkCommand::ListTubes);
 
     list_tubes.parse_stream(input)
+  }
+
+  fn list_tube_used() -> BeanstalkParser<BeanstalkCommand, I> {
+    fn_parser(Beanstalk::<I>::list_tube_used_)
+  }
+
+  fn list_tube_used_(input: I) -> ParseResult<BeanstalkCommand, I> {
+    // list-tube-used\r\n
+    let mut list_tube_used = bytes(b"list-tube-used")
+      .skip(crlf())
+      .map(|_| BeanstalkCommand::ListTubeUsed);
+
+    list_tube_used.parse_stream(input)
+  }
+
+  fn list_tubes_watched() -> BeanstalkParser<BeanstalkCommand, I> {
+    fn_parser(Beanstalk::<I>::list_tubes_watched_)
+  }
+
+  fn list_tubes_watched_(input: I) -> ParseResult<BeanstalkCommand, I> {
+    // list-tubes-watched\r\n
+    let mut list_tubes_watched = bytes(b"list-tubes-watched")
+      .skip(crlf())
+      .map(|_| BeanstalkCommand::ListTubesWatched);
+
+    list_tubes_watched.parse_stream(input)
+  }
+
+  fn quit() -> BeanstalkParser<BeanstalkCommand, I> {
+    fn_parser(Beanstalk::<I>::quit_)
+  }
+
+  fn quit_(input: I) -> ParseResult<BeanstalkCommand, I> {
+    // quit\r\n
+    let mut quit = bytes(b"quit")
+      .skip(crlf())
+      .map(|_| BeanstalkCommand::Quit);
+
+    quit.parse_stream(input)
+  }
+
+  fn pause_tube() -> BeanstalkParser<BeanstalkCommand, I> {
+    fn_parser(Beanstalk::<I>::pause_tube_)
+  }
+
+  fn pause_tube_(input: I) -> ParseResult<BeanstalkCommand, I> {
+    // pause_tube <tube> <delay>\r\n
+    let mut pause_tube = bytes(b"pause-tube")
+      .skip(byte(b' '))
+      .with(Beanstalk::name())
+      .skip(byte(b' '))
+      .and(Beanstalk::number())
+      .skip(crlf())
+      .map(|(tube, delay)| BeanstalkCommand::PauseTube(tube, delay));
+
+    pause_tube.parse_stream(input)
   }
 
   fn command() -> BeanstalkParser<BeanstalkCommand, I> {
@@ -521,25 +650,29 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn command_(input: I) -> ParseResult<BeanstalkCommand, I> {
-    let mut parser = Beanstalk::put()
-      .or(Beanstalk::use_parser())
+    let mut parser = try(Beanstalk::put())
+      .or(try(Beanstalk::use_parser()))
       .or(try(Beanstalk::reserve()))
-      .or(Beanstalk::reserve_with_timeout())
-      .or(Beanstalk::delete())
-      .or(Beanstalk::release())
-      .or(Beanstalk::bury())
-      .or(Beanstalk::touch())
-      .or(Beanstalk::watch())
-      .or(Beanstalk::ignore())
-      .or(Beanstalk::peek())
-      .or(Beanstalk::peek_ready())
-      .or(Beanstalk::peek_delayed())
-      .or(Beanstalk::kick())
-      .or(Beanstalk::kick_job())
-      .or(Beanstalk::stats_job())
-      .or(Beanstalk::stats_tube())
-      .or(Beanstalk::stats())
-      .or(Beanstalk::list_tubes());
+      .or(try(Beanstalk::reserve_with_timeout()))
+      .or(try(Beanstalk::delete()))
+      .or(try(Beanstalk::release()))
+      .or(try(Beanstalk::bury()))
+      .or(try(Beanstalk::touch()))
+      .or(try(Beanstalk::watch()))
+      .or(try(Beanstalk::ignore()))
+      .or(try(Beanstalk::peek()))
+      .or(try(Beanstalk::peek_ready()))
+      .or(try(Beanstalk::peek_delayed()))
+      .or(try(Beanstalk::kick()))
+      .or(try(Beanstalk::kick_job()))
+      .or(try(Beanstalk::stats()))
+      .or(try(Beanstalk::stats_job()))
+      .or(try(Beanstalk::stats_tube()))
+      .or(try(Beanstalk::list_tubes()))
+      .or(try(Beanstalk::list_tube_used()))
+      .or(try(Beanstalk::list_tubes_watched()))
+      .or(try(Beanstalk::quit()))
+      .or(Beanstalk::pause_tube());
 
     parser.parse_stream(input)
   }
@@ -550,25 +683,49 @@ pub struct LineCodec;
 
 impl Codec for LineCodec {
   type In = BeanstalkCommand;
-  type Out = String;
+  type Out = BeanstalkReply;
 
   fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Self::In>> {
+    // check if there's at least one \r\n
+    let clone = buf.clone();
+    let slice = clone.as_slice();
 
-    match Beanstalk::command().parse(State::new(buf.clone().as_slice())) {
-      Ok((value, state)) => {
-        buf.drain_to(state.position.position);
-        Ok(Some(value))
+    if let Some(index) = slice.iter().position(|&b| b == b'\r') {
+      // calculate how many lines to drain
+      let lines = if slice[0] == b'p' && slice[1] == b'u' && slice[2] == b't' {
+        1
+      } else {
+        0
+      };
+
+      let mut drain_index = index + 2;
+      let mut has_enough_lines = true;
+      for _ in 0..lines {
+        if let Some(j) = slice.iter().skip(drain_index).position(|&b| b == b'\r') {
+          drain_index += j + 2;
+        } else {
+          has_enough_lines = false;
+          break;
+        }
       }
-      Err(e) => {
-        println!("{:?}", e);
+
+      if has_enough_lines {
+        let drained_buffer = buf.drain_to(drain_index);
+        match Beanstalk::command().parse(State::new(drained_buffer.as_slice())) {
+          Ok((value, _state)) => Ok(Some(value)),
+          Err(_error) => Ok(Some(BeanstalkCommand::Unknown)),
+        }
+      } else {
         Ok(None)
       }
+    } else {
+      Ok(None)
     }
   }
 
-  fn encode(&mut self, msg: String, buf: &mut Vec<u8>) -> io::Result<()> {
-    buf.extend(msg.as_bytes());
-    buf.push(b'\n');
+  fn encode(&mut self, msg: BeanstalkReply, buf: &mut Vec<u8>) -> io::Result<()> {
+    let bytes: Vec<u8> = msg.into();
+    buf.extend_from_slice(&bytes);
     Ok(())
   }
 }
@@ -581,7 +738,7 @@ impl<T: Io + 'static> ServerProto<T> for LineProto {
   type Request = BeanstalkCommand;
 
   // response matches codec out type
-  type Response = String;
+  type Response = BeanstalkReply;
 
   // hook in the codec
   type Transport = Framed<T, LineCodec>;
@@ -598,7 +755,7 @@ pub struct Echo;
 impl Service for Echo {
   // must match protocol
   type Request = BeanstalkCommand;
-  type Response = String;
+  type Response = BeanstalkReply;
 
   // non streaming protocols, service errors are always io::Error
   type Error = io::Error;
@@ -607,7 +764,13 @@ impl Service for Echo {
   type Future = BoxFuture<Self::Response, Self::Error>;
 
   fn call(&self, req: Self::Request) -> Self::Future {
-    future::ok(format!("{}", req)).boxed()
+    println!("{:?}", req);
+    use BeanstalkCommand::*;
+
+    match req {
+      Unknown => future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed(),
+      c => future::ok(BeanstalkReply::Ok(c.to_string().into_bytes())).boxed(),
+    }
   }
 }
 
