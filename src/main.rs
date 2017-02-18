@@ -1,9 +1,10 @@
 extern crate rust_beanstalkd;
 extern crate futures;
-extern crate tokio_proto;
 extern crate clap;
 
 use clap::{Arg, App};
+
+use rust_beanstalkd::server;
 
 fn port_validator(v: String) -> Result<(), String> {
   v.parse()
@@ -27,5 +28,5 @@ fn main() {
   let port = matches.value_of("port").unwrap_or("11300");
   let addr = format!("127.0.0.1:{}", port).parse().unwrap();
 
-  rust_beanstalkd::serve(addr);
+  server::serve(addr);
 }

@@ -1,6 +1,11 @@
+// https://github.com/kr/beanstalkd/blob/master/doc/protocol.txt
+// https://tokio.rs/docs/getting-started/simple-server/use std::io;
+use std::net::SocketAddr;
 use std::io;
+
 use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
+use tokio_proto::TcpServer;
 use tokio_service::{Service, NewService};
 use futures::{future, Future, BoxFuture};
 
@@ -10,7 +15,7 @@ use command::*;
 use reply::*;
 
 // Codec
-pub struct BeanstalkCodec;
+struct BeanstalkCodec;
 
 impl Codec for BeanstalkCodec {
   type In = BeanstalkCommand;
@@ -62,7 +67,7 @@ impl Codec for BeanstalkCodec {
 }
 
 // Protocol
-pub struct BeanstalkProtocol;
+struct BeanstalkProtocol;
 
 impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
   // request matches codec in type
@@ -81,7 +86,7 @@ impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
 }
 
 // Service
-pub struct BeanstalkService {
+struct BeanstalkService {
   application: Box<BeanstalkApplication>
 }
 
@@ -110,10 +115,10 @@ impl Service for BeanstalkService {
 
 // Application
 #[derive(Clone)]
-pub struct BeanstalkApplication;
+struct BeanstalkApplication;
 
 impl BeanstalkApplication {
-  pub fn new() -> BeanstalkApplication {
+  fn new() -> BeanstalkApplication {
     BeanstalkApplication
   }
 }
@@ -127,4 +132,10 @@ impl NewService for BeanstalkApplication {
   fn new_service(&self) -> io::Result<Self::Instance> {
     Ok(BeanstalkService { application: Box::new(self.clone()) })
   }
+}
+
+pub fn serve(addr: SocketAddr) {
+  let application = BeanstalkApplication::new();
+  let server = TcpServer::new(BeanstalkProtocol, addr);
+  server.serve(application);
 }
