@@ -4,19 +4,22 @@ extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_service;
 extern crate combine;
+extern crate clap;
 
 use std::io;
 use std::str;
 use std::marker::PhantomData;
 use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
-use tokio_service::Service;
+use tokio_service::{Service, NewService};
 use futures::{future, Future, BoxFuture};
 use tokio_proto::TcpServer;
 
 use combine::primitives::{Parser, Stream, State, ParseResult};
 use combine::byte::{bytes, byte, digit, crlf, alpha_num};
 use combine::combinator::{FnParser, parser, many, count, none_of, try};
+
+use clap::{Arg, App};
 
 // https://github.com/kr/beanstalkd/blob/master/doc/protocol.txt
 // https://tokio.rs/docs/getting-started/simple-server/
@@ -252,7 +255,7 @@ impl std::fmt::Display for BeanstalkReply {
 }
 
 #[derive(Default)]
-pub struct Beanstalk<I>(PhantomData<fn(I) -> I>);
+pub struct BeanstalkCommandParser<I>(PhantomData<fn(I) -> I>);
 
 type BeanstalkParser<O, I> = FnParser<I, fn(I) -> ParseResult<O, I>>;
 
@@ -262,11 +265,11 @@ fn fn_parser<O, I>(f: fn(I) -> ParseResult<O, I>) -> BeanstalkParser<O, I>
   parser(f)
 }
 
-impl<'a, I> Beanstalk<I>
+impl<'a, I> BeanstalkCommandParser<I>
   where I: Stream<Item = u8, Range = &'a [u8]>
 {
   fn name() -> BeanstalkParser<String, I> {
-    fn_parser(Beanstalk::<I>::name_)
+    fn_parser(BeanstalkCommandParser::name_)
   }
 
   fn name_(input: I) -> ParseResult<String, I> {
@@ -287,7 +290,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn number() -> BeanstalkParser<u32, I> {
-    fn_parser(Beanstalk::<I>::number_)
+    fn_parser(BeanstalkCommandParser::number_)
   }
 
   fn number_(input: I) -> ParseResult<u32, I> {
@@ -299,20 +302,20 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn put() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::put_)
+    fn_parser(BeanstalkCommandParser::put_)
   }
 
   fn put_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // put <pri> <delay> <ttr> <bytes>\r\n<data>\r\n
     let mut put = bytes(b"put")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(crlf())
       .and(many(none_of(b"\r\n".iter().cloned())))
       .skip(crlf())
@@ -324,14 +327,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn use_parser() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::use_)
+    fn_parser(BeanstalkCommandParser::use_)
   }
 
   fn use_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // use <tube>\r\n
     let mut use_parser = bytes(b"use")
       .skip(byte(b' '))
-      .with(Beanstalk::name())
+      .with(BeanstalkCommandParser::name())
       .skip(crlf())
       .map(BeanstalkCommand::Use);
 
@@ -339,7 +342,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn reserve() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::reserve_)
+    fn_parser(BeanstalkCommandParser::reserve_)
   }
 
   fn reserve_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -352,14 +355,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn reserve_with_timeout() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::reserve_with_timeout_)
+    fn_parser(BeanstalkCommandParser::reserve_with_timeout_)
   }
 
   fn reserve_with_timeout_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // reserve-with-timeout <seconds>\r\n
     let mut reserve_with_timeout = bytes(b"reserve-with-timeout")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(|seconds| BeanstalkCommand::Reserve(Some(seconds)));
 
@@ -367,14 +370,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn delete() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::delete_)
+    fn_parser(BeanstalkCommandParser::delete_)
   }
 
   fn delete_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // delete <id>\r\n
     let mut delete = bytes(b"delete")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(BeanstalkCommand::Delete);
 
@@ -382,18 +385,18 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn release() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::release_)
+    fn_parser(BeanstalkCommandParser::release_)
   }
 
   fn release_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // release <id> <pri> <delay>\r\n
     let mut release = bytes(b"release")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(|((id, priority), delay)| BeanstalkCommand::Release(id, priority, delay));
 
@@ -401,16 +404,16 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn bury() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::bury_)
+    fn_parser(BeanstalkCommandParser::bury_)
   }
 
   fn bury_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // bury <id> <pri>\r\n
     let mut bury = bytes(b"bury")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(|(id, priority)| BeanstalkCommand::Bury(id, priority));
 
@@ -418,14 +421,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn touch() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::touch_)
+    fn_parser(BeanstalkCommandParser::touch_)
   }
 
   fn touch_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // touch <id>\r\n
     let mut touch = bytes(b"touch")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(BeanstalkCommand::Touch);
 
@@ -433,14 +436,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn watch() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::watch_)
+    fn_parser(BeanstalkCommandParser::watch_)
   }
 
   fn watch_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // watch <tube>\r\n
     let mut watch = bytes(b"watch")
       .skip(byte(b' '))
-      .with(Beanstalk::name())
+      .with(BeanstalkCommandParser::name())
       .skip(crlf())
       .map(BeanstalkCommand::Watch);
 
@@ -448,14 +451,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn ignore() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::ignore_)
+    fn_parser(BeanstalkCommandParser::ignore_)
   }
 
   fn ignore_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // ignore <tube>\r\n
     let mut ignore = bytes(b"ignore")
       .skip(byte(b' '))
-      .with(Beanstalk::name())
+      .with(BeanstalkCommandParser::name())
       .skip(crlf())
       .map(BeanstalkCommand::Ignore);
 
@@ -463,14 +466,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn peek() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::peek_)
+    fn_parser(BeanstalkCommandParser::peek_)
   }
 
   fn peek_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // peek <id>\r\n
     let mut peek = bytes(b"peek")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(BeanstalkCommand::Peek);
 
@@ -478,7 +481,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn peek_ready() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::peek_ready_)
+    fn_parser(BeanstalkCommandParser::peek_ready_)
   }
 
   fn peek_ready_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -491,7 +494,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn peek_delayed() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::peek_delayed_)
+    fn_parser(BeanstalkCommandParser::peek_delayed_)
   }
 
   fn peek_delayed_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -504,14 +507,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn kick() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::kick_)
+    fn_parser(BeanstalkCommandParser::kick_)
   }
 
   fn kick_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // kick <bound>\r\n
     let mut kick = bytes(b"kick")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(BeanstalkCommand::Kick);
 
@@ -519,14 +522,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn kick_job() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::kick_job_)
+    fn_parser(BeanstalkCommandParser::kick_job_)
   }
 
   fn kick_job_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // kick-job <id>\r\n
     let mut kick_job = bytes(b"kick-job")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(BeanstalkCommand::KickJob);
 
@@ -534,14 +537,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn stats_job() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::stats_job_)
+    fn_parser(BeanstalkCommandParser::stats_job_)
   }
 
   fn stats_job_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // stats-job <id>\r\n
     let mut stats_job = bytes(b"stats-job")
       .skip(byte(b' '))
-      .with(Beanstalk::number())
+      .with(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(BeanstalkCommand::StatsJob);
 
@@ -549,14 +552,14 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn stats_tube() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::stats_tube_)
+    fn_parser(BeanstalkCommandParser::stats_tube_)
   }
 
   fn stats_tube_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // stats-tube <tube>\r\n
     let mut stats_tube = bytes(b"stats-tube")
       .skip(byte(b' '))
-      .with(Beanstalk::name())
+      .with(BeanstalkCommandParser::name())
       .skip(crlf())
       .map(BeanstalkCommand::StatsTube);
 
@@ -564,7 +567,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn stats() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::stats_)
+    fn_parser(BeanstalkCommandParser::stats_)
   }
 
   fn stats_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -577,7 +580,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn list_tubes() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::list_tubes_)
+    fn_parser(BeanstalkCommandParser::list_tubes_)
   }
 
   fn list_tubes_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -590,7 +593,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn list_tube_used() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::list_tube_used_)
+    fn_parser(BeanstalkCommandParser::list_tube_used_)
   }
 
   fn list_tube_used_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -603,7 +606,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn list_tubes_watched() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::list_tubes_watched_)
+    fn_parser(BeanstalkCommandParser::list_tubes_watched_)
   }
 
   fn list_tubes_watched_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -616,7 +619,7 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn quit() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::quit_)
+    fn_parser(BeanstalkCommandParser::quit_)
   }
 
   fn quit_(input: I) -> ParseResult<BeanstalkCommand, I> {
@@ -629,16 +632,16 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn pause_tube() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::pause_tube_)
+    fn_parser(BeanstalkCommandParser::pause_tube_)
   }
 
   fn pause_tube_(input: I) -> ParseResult<BeanstalkCommand, I> {
     // pause_tube <tube> <delay>\r\n
     let mut pause_tube = bytes(b"pause-tube")
       .skip(byte(b' '))
-      .with(Beanstalk::name())
+      .with(BeanstalkCommandParser::name())
       .skip(byte(b' '))
-      .and(Beanstalk::number())
+      .and(BeanstalkCommandParser::number())
       .skip(crlf())
       .map(|(tube, delay)| BeanstalkCommand::PauseTube(tube, delay));
 
@@ -646,33 +649,33 @@ impl<'a, I> Beanstalk<I>
   }
 
   fn command() -> BeanstalkParser<BeanstalkCommand, I> {
-    fn_parser(Beanstalk::<I>::command_)
+    fn_parser(BeanstalkCommandParser::command_)
   }
 
   fn command_(input: I) -> ParseResult<BeanstalkCommand, I> {
-    let mut parser = try(Beanstalk::put())
-      .or(try(Beanstalk::use_parser()))
-      .or(try(Beanstalk::reserve()))
-      .or(try(Beanstalk::reserve_with_timeout()))
-      .or(try(Beanstalk::delete()))
-      .or(try(Beanstalk::release()))
-      .or(try(Beanstalk::bury()))
-      .or(try(Beanstalk::touch()))
-      .or(try(Beanstalk::watch()))
-      .or(try(Beanstalk::ignore()))
-      .or(try(Beanstalk::peek()))
-      .or(try(Beanstalk::peek_ready()))
-      .or(try(Beanstalk::peek_delayed()))
-      .or(try(Beanstalk::kick()))
-      .or(try(Beanstalk::kick_job()))
-      .or(try(Beanstalk::stats()))
-      .or(try(Beanstalk::stats_job()))
-      .or(try(Beanstalk::stats_tube()))
-      .or(try(Beanstalk::list_tubes()))
-      .or(try(Beanstalk::list_tube_used()))
-      .or(try(Beanstalk::list_tubes_watched()))
-      .or(try(Beanstalk::quit()))
-      .or(Beanstalk::pause_tube());
+    let mut parser = try(BeanstalkCommandParser::put())
+      .or(try(BeanstalkCommandParser::use_parser()))
+      .or(try(BeanstalkCommandParser::reserve()))
+      .or(try(BeanstalkCommandParser::reserve_with_timeout()))
+      .or(try(BeanstalkCommandParser::delete()))
+      .or(try(BeanstalkCommandParser::release()))
+      .or(try(BeanstalkCommandParser::bury()))
+      .or(try(BeanstalkCommandParser::touch()))
+      .or(try(BeanstalkCommandParser::watch()))
+      .or(try(BeanstalkCommandParser::ignore()))
+      .or(try(BeanstalkCommandParser::peek()))
+      .or(try(BeanstalkCommandParser::peek_ready()))
+      .or(try(BeanstalkCommandParser::peek_delayed()))
+      .or(try(BeanstalkCommandParser::kick()))
+      .or(try(BeanstalkCommandParser::kick_job()))
+      .or(try(BeanstalkCommandParser::stats()))
+      .or(try(BeanstalkCommandParser::stats_job()))
+      .or(try(BeanstalkCommandParser::stats_tube()))
+      .or(try(BeanstalkCommandParser::list_tubes()))
+      .or(try(BeanstalkCommandParser::list_tube_used()))
+      .or(try(BeanstalkCommandParser::list_tubes_watched()))
+      .or(try(BeanstalkCommandParser::quit()))
+      .or(BeanstalkCommandParser::pause_tube());
 
     parser.parse_stream(input)
   }
@@ -711,7 +714,7 @@ impl Codec for LineCodec {
 
       if has_enough_lines {
         let drained_buffer = buf.drain_to(drain_index);
-        match Beanstalk::command().parse(State::new(drained_buffer.as_slice())) {
+        match BeanstalkCommandParser::command().parse(State::new(drained_buffer.as_slice())) {
           Ok((value, _state)) => Ok(Some(value)),
           Err(_error) => Ok(Some(BeanstalkCommand::Unknown)),
         }
@@ -750,9 +753,11 @@ impl<T: Io + 'static> ServerProto<T> for LineProto {
 }
 
 // Service
-pub struct Echo;
+pub struct BeanstalkService {
+  application: Box<BeanstalkApplication>
+}
 
-impl Service for Echo {
+impl Service for BeanstalkService {
   // must match protocol
   type Request = BeanstalkCommand;
   type Response = BeanstalkReply;
@@ -767,6 +772,8 @@ impl Service for Echo {
     println!("{:?}", req);
     use BeanstalkCommand::*;
 
+    // TODO use futures::sync::mpsc::unbounded to send to an application
+
     match req {
       Unknown => future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed(),
       c => future::ok(BeanstalkReply::Ok(c.to_string().into_bytes())).boxed(),
@@ -774,10 +781,51 @@ impl Service for Echo {
   }
 }
 
+// Application
+#[derive(Clone)]
+pub struct BeanstalkApplication;
+
+impl BeanstalkApplication {
+  pub fn new() -> BeanstalkApplication {
+    BeanstalkApplication
+  }
+}
+
+impl NewService for BeanstalkApplication {
+  type Request = BeanstalkCommand;
+  type Response = BeanstalkReply;
+  type Error = io::Error;
+  type Instance = BeanstalkService;
+
+  fn new_service(&self) -> io::Result<Self::Instance> {
+    Ok(BeanstalkService { application: Box::new(self.clone()) })
+  }
+}
+
+fn port_validator(v: String) -> Result<(), String> {
+  v.parse()
+    .map(|_: u16| ())
+    .map_err(|_| format!("{} is an invalid port.", v))
+}
+
 fn main() {
-  let addr = "127.0.0.1:11300".parse().unwrap();
+  let matches = App::new("rust-beanstalkd")
+    .version("0.2.0")
+    .author("Nicholas Dujay <nickdujay@gmail.com>")
+    .about("A pure rust implementation of beanstalkd. See http://kr.github.io/beanstalkd/.")
+    .arg(Arg::with_name("port")
+      .short("p")
+      .long("port")
+      .value_name("PORT")
+      .takes_value(true)
+      .validator(port_validator))
+    .get_matches();
 
+  let port = matches.value_of("port").unwrap_or("11300");
+
+  let application = BeanstalkApplication::new();
+
+  let addr = format!("127.0.0.1:{}", port).parse().unwrap();
   let server = TcpServer::new(LineProto, addr);
-
-  server.serve(|| Ok(Echo));
+  server.serve(application);
 }
