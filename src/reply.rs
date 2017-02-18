@@ -98,7 +98,7 @@ impl From<BeanstalkReply> for Vec<u8> {
         bytes
       }
       Error(e) => e.into(),
-      reply => reply.to_string().into_bytes()
+      reply => reply.to_string().into_bytes(),
     }
   }
 }

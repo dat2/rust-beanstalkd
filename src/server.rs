@@ -7,7 +7,9 @@ use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
 use tokio_proto::TcpServer;
 use tokio_service::{Service, NewService};
-use futures::{future, Future, BoxFuture};
+use futures::{future, Future, BoxFuture, Poll, Async, StartSend};
+use futures::stream::Stream;
+use futures::sink::Sink;
 
 use combine::primitives::{State, Parser};
 
@@ -15,6 +17,7 @@ use command::*;
 use reply::*;
 
 // Codec
+#[derive(Default)]
 struct BeanstalkCodec;
 
 impl Codec for BeanstalkCodec {
@@ -66,7 +69,39 @@ impl Codec for BeanstalkCodec {
   }
 }
 
+struct WrappedFrameTransport<T> {
+  framed: Framed<T, BeanstalkCodec>
+}
+
+impl<T: Io + 'static> Stream for WrappedFrameTransport<T> {
+  type Item = BeanstalkCommand;
+  type Error = io::Error;
+
+  fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    let poll_result = self.framed.poll();
+    if let Ok(Async::Ready(Some(BeanstalkCommand::Quit))) = poll_result {
+      Ok(Async::Ready(None))
+    } else {
+      poll_result
+    }
+  }
+}
+
+impl<T: Io + 'static> Sink for WrappedFrameTransport<T> {
+  type SinkItem = BeanstalkReply;
+  type SinkError = io::Error;
+
+  fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
+    self.framed.start_send(item)
+  }
+
+  fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+    self.framed.poll_complete()
+  }
+}
+
 // Protocol
+#[derive(Default)]
 struct BeanstalkProtocol;
 
 impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
@@ -77,17 +112,17 @@ impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
   type Response = BeanstalkReply;
 
   // hook in the codec
-  type Transport = Framed<T, BeanstalkCodec>;
+  type Transport = WrappedFrameTransport<T>;
   type BindTransport = Result<Self::Transport, io::Error>;
 
   fn bind_transport(&self, io: T) -> Self::BindTransport {
-    Ok(io.framed(BeanstalkCodec))
+    Ok(WrappedFrameTransport { framed: io.framed(BeanstalkCodec) })
   }
 }
 
 // Service
 struct BeanstalkService {
-  application: Box<BeanstalkApplication>
+  application: Box<BeanstalkApplication>,
 }
 
 impl Service for BeanstalkService {
@@ -107,7 +142,9 @@ impl Service for BeanstalkService {
     // TODO use futures::sync::mpsc::unbounded to send to an application
 
     match req {
-      BeanstalkCommand::Unknown => future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed(),
+      BeanstalkCommand::Unknown => {
+        future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed()
+      }
       c => future::ok(BeanstalkReply::Ok(c.to_string().into_bytes())).boxed(),
     }
   }
