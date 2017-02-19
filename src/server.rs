@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::io;
 use std::thread;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver};
 
 use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
@@ -192,7 +192,7 @@ impl NewService for BeanstalkApplication {
 }
 
 pub fn serve(addr: SocketAddr) {
-  let (tx, rx) = channel();
+  let (tx, rx) = sync_channel(1);
   thread::spawn(move|| {
     for i in 1.. {
       tx.send(i).unwrap();
