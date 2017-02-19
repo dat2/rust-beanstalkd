@@ -2,12 +2,14 @@
 // https://tokio.rs/docs/getting-started/simple-server/use std::io;
 use std::net::SocketAddr;
 use std::io;
+use std::thread;
+use std::sync::mpsc::{channel, Receiver};
 
 use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
 use tokio_proto::TcpServer;
 use tokio_service::{Service, NewService};
-use futures::{future, Future, BoxFuture, Poll, Async, StartSend};
+use futures::{future, Future, BoxFuture, Poll, StartSend};
 use futures::stream::Stream;
 use futures::sink::Sink;
 
@@ -69,21 +71,30 @@ impl Codec for BeanstalkCodec {
   }
 }
 
+// TODO notify the application that we need to end this connection
 struct WrappedFrameTransport<T> {
+  client_id: usize,
   framed: Framed<T, BeanstalkCodec>
 }
 
+impl<T> WrappedFrameTransport<T> {
+  fn new(client_id: usize, framed: Framed<T, BeanstalkCodec>) -> WrappedFrameTransport<T> {
+    WrappedFrameTransport { client_id: client_id, framed: framed }
+  }
+}
+
 impl<T: Io + 'static> Stream for WrappedFrameTransport<T> {
-  type Item = BeanstalkCommand;
+  type Item = (usize, BeanstalkCommand);
   type Error = io::Error;
 
   fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
     let poll_result = self.framed.poll();
-    if let Ok(Async::Ready(Some(BeanstalkCommand::Quit))) = poll_result {
-      Ok(Async::Ready(None))
-    } else {
-      poll_result
-    }
+
+    poll_result.map(|async_option| {
+      async_option.map(|async| {
+        async.map(|command| (self.client_id, command))
+      })
+    })
   }
 }
 
@@ -101,12 +112,21 @@ impl<T: Io + 'static> Sink for WrappedFrameTransport<T> {
 }
 
 // Protocol
-#[derive(Default)]
-struct BeanstalkProtocol;
+struct BeanstalkProtocol {
+  rx: Receiver<usize>
+}
+
+unsafe impl Sync for BeanstalkProtocol {}
+
+impl BeanstalkProtocol {
+  fn new(rx: Receiver<usize>) -> BeanstalkProtocol {
+    BeanstalkProtocol { rx: rx }
+  }
+}
 
 impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
   // request matches codec in type
-  type Request = BeanstalkCommand;
+  type Request = (usize, BeanstalkCommand);
 
   // response matches codec out type
   type Response = BeanstalkReply;
@@ -116,7 +136,7 @@ impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
   type BindTransport = Result<Self::Transport, io::Error>;
 
   fn bind_transport(&self, io: T) -> Self::BindTransport {
-    Ok(WrappedFrameTransport { framed: io.framed(BeanstalkCodec) })
+    Ok(WrappedFrameTransport::new(self.rx.recv().unwrap(), io.framed(BeanstalkCodec)))
   }
 }
 
@@ -127,7 +147,7 @@ struct BeanstalkService {
 
 impl Service for BeanstalkService {
   // must match protocol
-  type Request = BeanstalkCommand;
+  type Request = (usize, BeanstalkCommand);
   type Response = BeanstalkReply;
 
   // non streaming protocols, service errors are always io::Error
@@ -142,10 +162,10 @@ impl Service for BeanstalkService {
     // TODO use futures::sync::mpsc::unbounded to send to an application
 
     match req {
-      BeanstalkCommand::Unknown => {
+      (_client_id, BeanstalkCommand::Unknown) => {
         future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed()
       }
-      c => future::ok(BeanstalkReply::Ok(c.to_string().into_bytes())).boxed(),
+      c => future::ok(BeanstalkReply::Ok(Vec::new())).boxed(),
     }
   }
 }
@@ -161,7 +181,7 @@ impl BeanstalkApplication {
 }
 
 impl NewService for BeanstalkApplication {
-  type Request = BeanstalkCommand;
+  type Request = (usize, BeanstalkCommand);
   type Response = BeanstalkReply;
   type Error = io::Error;
   type Instance = BeanstalkService;
@@ -172,7 +192,14 @@ impl NewService for BeanstalkApplication {
 }
 
 pub fn serve(addr: SocketAddr) {
+  let (tx, rx) = channel();
+  thread::spawn(move|| {
+    for i in 1.. {
+      tx.send(i).unwrap();
+    }
+  });
+
   let application = BeanstalkApplication::new();
-  let server = TcpServer::new(BeanstalkProtocol, addr);
+  let server = TcpServer::new(BeanstalkProtocol::new(rx), addr);
   server.serve(application);
 }
