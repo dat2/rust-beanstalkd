@@ -145,6 +145,7 @@ impl<'a, I> BeanstalkCommandParser<I>
       .skip(byte(b' '))
       .and(BeanstalkCommandParser::number())
       .skip(crlf())
+      // TODO use <bytes> to limit <data>
       .and(many(none_of(b"\r\n".iter().cloned())))
       .skip(crlf())
       .map(|((((priority, delay), ttr), n_bytes), bytes)| {

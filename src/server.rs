@@ -2,13 +2,13 @@
 // https://tokio.rs/docs/getting-started/simple-server/use std::io;
 use std::net::SocketAddr;
 use std::io;
-use std::thread;
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, Condvar};
 
 use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
 use tokio_proto::TcpServer;
-use tokio_service::{Service, NewService};
+use tokio_service::Service;
 use futures::{future, Future, BoxFuture, Poll, StartSend};
 use futures::stream::Stream;
 use futures::sink::Sink;
@@ -17,6 +17,7 @@ use combine::primitives::{State, Parser};
 
 use command::*;
 use reply::*;
+use log_service::Log;
 
 // Codec
 #[derive(Default)]
@@ -74,12 +75,15 @@ impl Codec for BeanstalkCodec {
 // TODO notify the application that we need to end this connection
 struct WrappedFrameTransport<T> {
   client_id: usize,
-  framed: Framed<T, BeanstalkCodec>
+  framed: Framed<T, BeanstalkCodec>,
 }
 
 impl<T> WrappedFrameTransport<T> {
   fn new(client_id: usize, framed: Framed<T, BeanstalkCodec>) -> WrappedFrameTransport<T> {
-    WrappedFrameTransport { client_id: client_id, framed: framed }
+    WrappedFrameTransport {
+      client_id: client_id,
+      framed: framed,
+    }
   }
 }
 
@@ -113,14 +117,15 @@ impl<T: Io + 'static> Sink for WrappedFrameTransport<T> {
 
 // Protocol
 struct BeanstalkProtocol {
-  rx: Receiver<usize>
+  mutex: Mutex<usize>,
 }
 
 unsafe impl Sync for BeanstalkProtocol {}
 
 impl BeanstalkProtocol {
-  fn new(rx: Receiver<usize>) -> BeanstalkProtocol {
-    BeanstalkProtocol { rx: rx }
+  fn new() -> BeanstalkProtocol {
+    let mutex = Mutex::new(0);
+    BeanstalkProtocol { mutex: mutex }
   }
 }
 
@@ -136,13 +141,26 @@ impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
   type BindTransport = Result<Self::Transport, io::Error>;
 
   fn bind_transport(&self, io: T) -> Self::BindTransport {
-    Ok(WrappedFrameTransport::new(self.rx.recv().unwrap(), io.framed(BeanstalkCodec)))
+    let mut mutex = self.mutex.lock().unwrap();
+    *mutex += 1;
+    info!(target: "beanstalkd", "[PROTO] Client {:?}", *mutex);
+    Ok(WrappedFrameTransport::new(*mutex, io.framed(BeanstalkCodec)))
   }
 }
 
 // Service
 struct BeanstalkService {
-  application: Box<BeanstalkApplication>,
+  default_tube: Tube<(u32, Vec<u8>)>,
+  id: Mutex<u32>,
+}
+
+impl BeanstalkService {
+  fn new() -> BeanstalkService {
+    BeanstalkService {
+      default_tube: Tube::new(),
+      id: Mutex::new(0),
+    }
+  }
 }
 
 impl Service for BeanstalkService {
@@ -157,49 +175,58 @@ impl Service for BeanstalkService {
   type Future = BoxFuture<Self::Response, Self::Error>;
 
   fn call(&self, req: Self::Request) -> Self::Future {
-    println!("{:?}", req);
-
     // TODO use futures::sync::mpsc::unbounded to send to an application
 
-    match req {
-      (_client_id, BeanstalkCommand::Unknown) => {
+    match req.1 {
+      BeanstalkCommand::Put(_priority, _delay, _ttr, _bytes, data) => {
+        let mut mutex = self.id.lock().unwrap();
+        *mutex += 1;
+        self.default_tube.insert((*mutex, data));
+        future::ok(BeanstalkReply::Inserted(*mutex)).boxed()
+      }
+      BeanstalkCommand::Reserve(None) => {
+        let (id, data) = self.default_tube.reserve();
+        future::ok(BeanstalkReply::Reserved(id, data)).boxed()
+      }
+      BeanstalkCommand::Unknown => {
         future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed()
       }
-      c => future::ok(BeanstalkReply::Ok(Vec::new())).boxed(),
+      _c => future::ok(BeanstalkReply::Ok(Vec::new())).boxed(),
     }
   }
 }
 
-// Application
-#[derive(Clone)]
-struct BeanstalkApplication;
-
-impl BeanstalkApplication {
-  fn new() -> BeanstalkApplication {
-    BeanstalkApplication
-  }
+struct Tube<T> {
+  queue: Mutex<VecDeque<T>>,
+  cvar: Condvar,
 }
 
-impl NewService for BeanstalkApplication {
-  type Request = (usize, BeanstalkCommand);
-  type Response = BeanstalkReply;
-  type Error = io::Error;
-  type Instance = BeanstalkService;
+impl<T> Tube<T> {
+  fn new() -> Tube<T> {
+    let queue = Mutex::new(VecDeque::new());
+    let cvar = Condvar::new();
+    Tube {
+      queue: queue,
+      cvar: cvar,
+    }
+  }
 
-  fn new_service(&self) -> io::Result<Self::Instance> {
-    Ok(BeanstalkService { application: Box::new(self.clone()) })
+  fn insert(&self, t: T) {
+    let mut queue = self.queue.lock().unwrap();
+    queue.push_front(t);
+    self.cvar.notify_one();
+  }
+
+  fn reserve(&self) -> T {
+    let mut queue = self.queue.lock().unwrap();
+    while queue.is_empty() {
+      queue = self.cvar.wait(queue).unwrap();
+    }
+    queue.pop_back().unwrap()
   }
 }
 
 pub fn serve(addr: SocketAddr) {
-  let (tx, rx) = sync_channel(1);
-  thread::spawn(move|| {
-    for i in 1.. {
-      tx.send(i).unwrap();
-    }
-  });
-
-  let application = BeanstalkApplication::new();
-  let server = TcpServer::new(BeanstalkProtocol::new(rx), addr);
-  server.serve(application);
+  let server = TcpServer::new(BeanstalkProtocol::new(), addr);
+  server.serve(|| Ok(Log::new(BeanstalkService::new())));
 }

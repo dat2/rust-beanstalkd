@@ -1,6 +1,7 @@
 extern crate rust_beanstalkd;
 extern crate futures;
 extern crate clap;
+extern crate env_logger;
 
 use clap::{Arg, App};
 
@@ -13,6 +14,8 @@ fn port_validator(v: String) -> Result<(), String> {
 }
 
 fn main() {
+  env_logger::init().unwrap();
+
   let matches = App::new("rust-beanstalkd")
     .version("0.2.0")
     .author("Nicholas Dujay <nickdujay@gmail.com>")
