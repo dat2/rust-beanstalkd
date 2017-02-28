@@ -2,6 +2,7 @@ use std::fmt;
 use std::convert::From;
 
 // beanstalkd error messages
+#[derive(Debug)]
 pub enum BeanstalkError {
   OutOfMemory,
   InternalError,
@@ -34,8 +35,9 @@ impl From<BeanstalkError> for Vec<u8> {
   }
 }
 
+#[derive(Debug)]
 pub enum BeanstalkReply {
-  Inserted(u32),
+  Inserted(Box<u32>),
   Buried(Option<u32>),
   Using(String),
   Reserved(u32, Vec<u8>),
@@ -59,7 +61,7 @@ impl From<BeanstalkReply> for Vec<u8> {
     use self::BeanstalkReply::*;
 
     match reply {
-      Inserted(id) => format!("INSERTED {}\r\n", id).into_bytes(),
+      Inserted(ref id) => format!("INSERTED {}\r\n", id).into_bytes(),
       Buried(id) => {
         format!("BURIED{}\r\n",
                 if let Some(i) = id {
@@ -108,7 +110,7 @@ impl fmt::Display for BeanstalkReply {
     use self::BeanstalkReply::*;
 
     match *self {
-      Inserted(id) => write!(f, "INSERTED {}\r\n", id),
+      Inserted(ref id) => write!(f, "INSERTED {}\r\n", id),
       Buried(id) => {
         write!(f,
                "BURIED{}\r\n",

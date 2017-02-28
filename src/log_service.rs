@@ -14,7 +14,8 @@ impl<S> Log<S> {
 
 impl<S> Service for Log<S>
   where S: Service,
-        S::Request: fmt::Debug
+        S::Request: fmt::Debug,
+        S::Response: fmt::Debug
 {
   type Request = S::Request;
   type Response = S::Response;
@@ -23,6 +24,16 @@ impl<S> Service for Log<S>
 
   fn call(&self, request: Self::Request) -> Self::Future {
     info!(target: "beanstalkd", "[REQUEST] {:?}", request);
-    self.upstream.call(request)
+    self.upstream
+      .call(request)
+      // .then(|result| {
+      //   match result {
+      //     Ok(reply) => {
+      //       info!(target: "beanstalkd", "[REPLY] {:?}", reply);
+      //       Ok(reply)
+      //     }
+      //     e => e,
+      //   }
+      // })
   }
 }

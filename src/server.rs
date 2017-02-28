@@ -2,8 +2,7 @@
 // https://tokio.rs/docs/getting-started/simple-server/use std::io;
 use std::net::SocketAddr;
 use std::io;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::Mutex;
 
 use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_proto::pipeline::ServerProto;
@@ -12,6 +11,7 @@ use tokio_service::Service;
 use futures::{future, Future, BoxFuture, Poll, StartSend};
 use futures::stream::Stream;
 use futures::sink::Sink;
+use multiqueue::{mpmc_fut_queue, MPMCFutSender, MPMCFutReceiver};
 
 use combine::primitives::{State, Parser};
 
@@ -120,8 +120,6 @@ struct BeanstalkProtocol {
   mutex: Mutex<usize>,
 }
 
-unsafe impl Sync for BeanstalkProtocol {}
-
 impl BeanstalkProtocol {
   fn new() -> BeanstalkProtocol {
     let mutex = Mutex::new(0);
@@ -150,14 +148,18 @@ impl<T: Io + 'static> ServerProto<T> for BeanstalkProtocol {
 
 // Service
 struct BeanstalkService {
-  default_tube: Tube<(u32, Vec<u8>)>,
+  tx: MPMCFutSender<(u32, Vec<u8>)>,
+  rx: MPMCFutReceiver<(u32, Vec<u8>)>,
   id: Mutex<u32>,
 }
 
 impl BeanstalkService {
   fn new() -> BeanstalkService {
+    let (tx, rx) = mpmc_fut_queue(10);
+
     BeanstalkService {
-      default_tube: Tube::new(),
+      tx: tx,
+      rx: rx,
       id: Mutex::new(0),
     }
   }
@@ -175,54 +177,37 @@ impl Service for BeanstalkService {
   type Future = BoxFuture<Self::Response, Self::Error>;
 
   fn call(&self, req: Self::Request) -> Self::Future {
-    // TODO use futures::sync::mpsc::unbounded to send to an application
-
     match req.1 {
       BeanstalkCommand::Put(_priority, _delay, _ttr, _bytes, data) => {
         let mut mutex = self.id.lock().unwrap();
         *mutex += 1;
-        self.default_tube.insert((*mutex, data));
-        future::ok(BeanstalkReply::Inserted(*mutex)).boxed()
+
+        let id = Box::new(*mutex);
+        self.tx
+          .clone()
+          .send((*mutex, data))
+          .map(|_| BeanstalkReply::Inserted(id))
+          .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+          .boxed()
       }
       BeanstalkCommand::Reserve(None) => {
-        let (id, data) = self.default_tube.reserve();
-        future::ok(BeanstalkReply::Reserved(id, data)).boxed()
+        self.rx.clone()
+          .into_future()
+          .map_err(|((), receiver)| io::Error::new(io::ErrorKind::Other, "stream is closed"))
+          .then(|result| match result {
+            Ok((opt, stream)) => match opt {
+              Some((id, data)) => Ok(BeanstalkReply::Reserved(id, data)),
+              None => Err(io::Error::new(io::ErrorKind::Other, "stream is closed"))
+            },
+            Err(e) => Err(e),
+          })
+          .boxed()
       }
       BeanstalkCommand::Unknown => {
         future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed()
       }
       _c => future::ok(BeanstalkReply::Ok(Vec::new())).boxed(),
     }
-  }
-}
-
-struct Tube<T> {
-  queue: Mutex<VecDeque<T>>,
-  cvar: Condvar,
-}
-
-impl<T> Tube<T> {
-  fn new() -> Tube<T> {
-    let queue = Mutex::new(VecDeque::new());
-    let cvar = Condvar::new();
-    Tube {
-      queue: queue,
-      cvar: cvar,
-    }
-  }
-
-  fn insert(&self, t: T) {
-    let mut queue = self.queue.lock().unwrap();
-    queue.push_front(t);
-    self.cvar.notify_one();
-  }
-
-  fn reserve(&self) -> T {
-    let mut queue = self.queue.lock().unwrap();
-    while queue.is_empty() {
-      queue = self.cvar.wait(queue).unwrap();
-    }
-    queue.pop_back().unwrap()
   }
 }
 
