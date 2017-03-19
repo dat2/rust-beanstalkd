@@ -2,7 +2,7 @@ use std::fmt;
 use std::convert::From;
 
 // beanstalkd error messages
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BeanstalkError {
   OutOfMemory,
   InternalError,
@@ -35,12 +35,12 @@ impl From<BeanstalkError> for Vec<u8> {
   }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BeanstalkReply {
-  Inserted(Box<u32>),
+  Inserted(Box<usize>),
   Buried(Option<u32>),
   Using(String),
-  Reserved(u32, Vec<u8>),
+  Reserved(usize, Vec<u8>),
   DeadlineSoon,
   TimedOut,
   Deleted,

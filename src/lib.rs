@@ -1,13 +1,14 @@
-#![feature(conservative_impl_trait)]
 #![recursion_limit = "1024"]
 extern crate futures;
+extern crate tokio_io;
+extern crate bytes;
 extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_service;
+extern crate tokio_timer;
 extern crate combine;
 #[macro_use]
 extern crate log;
-extern crate multiqueue;
 
 mod command;
 mod reply;
