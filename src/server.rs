@@ -3,10 +3,11 @@
 use std::net::SocketAddr;
 use std::io;
 use std::sync::Mutex;
-use std::sync::mpsc::{channel, Sender, Receiver, TryRecvError};
 use std::thread;
 use std::time::*;
+use std::error::Error;
 
+use tokio_core::reactor::Handle;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Encoder, Decoder, Framed};
 use tokio_timer::*;
@@ -14,8 +15,9 @@ use bytes::BytesMut;
 use tokio_proto::pipeline::ServerProto;
 use tokio_proto::TcpServer;
 use tokio_service::{Service, NewService};
-use futures::{future, Future, BoxFuture, Poll, StartSend, Stream, Sink, Async};
-use futures::task;
+use futures::{future, IntoFuture, Future, BoxFuture, Poll, StartSend, Stream, Sink, Async};
+use futures::sync::mpsc;
+use futures::sync::oneshot;
 
 use combine::primitives::{State, Parser};
 
@@ -80,6 +82,17 @@ impl Decoder for BeanstalkCodec {
   }
 }
 
+struct BeanstalkRequest {
+  client_id: usize,
+  command: BeanstalkCommand
+}
+
+impl BeanstalkRequest {
+  fn new(client_id: usize, command: BeanstalkCommand) -> BeanstalkRequest {
+    BeanstalkRequest { client_id: client_id, command: command }
+  }
+}
+
 // TODO notify the application that we need to end this connection
 struct WrappedFrameTransport<T> {
   client_id: usize,
@@ -96,7 +109,7 @@ impl<T: AsyncRead + AsyncWrite> WrappedFrameTransport<T> {
 }
 
 impl<T: AsyncRead + AsyncWrite + 'static> Stream for WrappedFrameTransport<T> {
-  type Item = (usize, BeanstalkCommand);
+  type Item = BeanstalkRequest;
   type Error = io::Error;
 
   fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
@@ -104,7 +117,7 @@ impl<T: AsyncRead + AsyncWrite + 'static> Stream for WrappedFrameTransport<T> {
 
     poll_result.map(|async_option| {
       async_option.map(|async| {
-        async.map(|command| (self.client_id, command))
+        async.map(|command| BeanstalkRequest::new(self.client_id, command))
       })
     })
   }
@@ -137,7 +150,7 @@ impl BeanstalkProtocol {
 
 impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for BeanstalkProtocol {
   // request matches codec in type
-  type Request = (usize, BeanstalkCommand);
+  type Request = BeanstalkRequest;
 
   // response matches codec out type
   type Response = BeanstalkReply;
@@ -154,127 +167,31 @@ impl<T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for BeanstalkProtocol {
   }
 }
 
-struct SendToken {
-  id: usize,
-}
-
-impl Future for SendToken {
-  type Item = usize;
-  type Error = io::Error;
-
-  fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-    Ok(Async::Ready(self.id))
-  }
-}
-
-struct ReserveToken {
-  rx: Receiver<(usize, Vec<u8>)>,
-  item: Result<(usize, Vec<u8>), TryRecvError>,
-}
-
-impl ReserveToken {
-  fn new(rx: Receiver<(usize, Vec<u8>)>) -> ReserveToken {
-    let item = rx.try_recv();
-    ReserveToken { rx: rx, item: item }
-  }
-
-  fn schedule_unpark(&mut self) {
-    let task = task::park();
-    thread::spawn(move || {
-      thread::sleep(Duration::from_millis(500));
-      task.unpark();
-    }).join().unwrap();
-    self.item = self.rx.try_recv();
-  }
-}
-
-impl Future for ReserveToken {
-  type Item = (usize, Vec<u8>);
-  type Error = io::Error;
-
-  fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-    match self.item {
-      Err(TryRecvError::Disconnected) => Err(io::Error::new(io::ErrorKind::Other, "disconnected")),
-      Err(TryRecvError::Empty) => {
-        self.schedule_unpark();
-        Ok(Async::NotReady)
-      },
-      Ok(ref item) => Ok(Async::Ready(item.clone()))
-    }
-  }
+enum ServiceMessage {
+  Put(oneshot::Sender<usize>, Vec<u8>)
 }
 
 // Service
+#[derive(Clone)]
 struct BeanstalkService {
-  item_tx: Sender<(usize, Vec<u8>)>,
-  reserve_tx: Sender<Sender<(usize, Vec<u8>)>>,
-  id: Mutex<usize>,
-}
-
-impl BeanstalkService {
-  fn new(item_tx: Sender<(usize, Vec<u8>)>, reserve_tx: Sender<Sender<(usize, Vec<u8>)>>) -> BeanstalkService {
-    BeanstalkService {
-      item_tx: item_tx,
-      reserve_tx: reserve_tx,
-      id: Mutex::new(0),
-    }
-  }
-
-  fn get_id(&self) -> usize {
-    let mut mutex = self.id.lock().unwrap();
-    *mutex += 1;
-    *mutex
-  }
-
-  fn get_reserve_token(&self) -> ReserveToken {
-    // TODO report error in Future for ReserveToken
-    let (tx, rx) = channel();
-    self.reserve_tx.send(tx).unwrap();
-    ReserveToken::new(rx)
-  }
-
-  fn get_send_token(&self, item: (usize, Vec<u8>)) -> SendToken {
-    // TODO report error in Future for SendToken
-    let send_token = SendToken { id: item.0 };
-    self.item_tx.send(item).unwrap();
-    send_token
-  }
+  tx: mpsc::UnboundedSender<ServiceMessage>,
 }
 
 impl Service for BeanstalkService {
-  // must match protocol
-  type Request = (usize, BeanstalkCommand);
+  type Request = BeanstalkRequest;
   type Response = BeanstalkReply;
-
-  // non streaming protocols, service errors are always io::Error
   type Error = io::Error;
-
-  // future for computing the response
   type Future = BoxFuture<Self::Response, Self::Error>;
 
   fn call(&self, req: Self::Request) -> Self::Future {
-    match req.1 {
+    match req.command {
       BeanstalkCommand::Put(_priority, _delay, _ttr, _bytes, data) => {
-        let id = self.get_id();
-        self.get_send_token((id, data))
-          .map(|id| BeanstalkReply::Inserted(Box::new(id)))
+        let (tx, rx) = oneshot::channel::<usize>();
+
+        self.tx.send(ServiceMessage::Put(tx, data))
+          .into_future()
+          .then(|_| future::ok(BeanstalkReply::Ok(Vec::new())))
           .boxed()
-      }
-      BeanstalkCommand::Reserve(timeout) => {
-        match timeout {
-          Some(seconds) => {
-            let timer = Timer::default();
-            // TODO timeout error kills the connection
-            timer.timeout(self.get_reserve_token().map(|(id, bytes)| BeanstalkReply::Reserved(id, bytes)),
-                          Duration::new(seconds as u64, 0))
-                  .boxed()
-          }
-          None => {
-            self.get_reserve_token()
-              .map(|(id, bytes)| BeanstalkReply::Reserved(id, bytes))
-              .boxed()
-          }
-        }
       }
       BeanstalkCommand::Unknown => {
         future::ok(BeanstalkReply::Error(BeanstalkError::UnknownCommand)).boxed()
@@ -284,44 +201,43 @@ impl Service for BeanstalkService {
   }
 }
 
-struct BeanstalkApplication {
-  item_tx: Sender<(usize, Vec<u8>)>,
-  reserve_tx: Sender<Sender<(usize, Vec<u8>)>>,
+struct BeanstalkServiceFactory {
+  tx: mpsc::UnboundedSender<ServiceMessage>
 }
 
-unsafe impl Send for BeanstalkApplication { }
-unsafe impl Sync for BeanstalkApplication { }
+impl BeanstalkServiceFactory {
+  fn new(handle: &Handle) -> BeanstalkServiceFactory {
+    let (tx, rx) = mpsc::unbounded();
 
-impl BeanstalkApplication {
-  fn new() -> BeanstalkApplication {
-    let (item_tx, item_rx) = channel();
-    let (reserve_tx, reserve_rx) = channel();
-
-    thread::spawn(move || {
-      loop {
-        let tx: Sender<(usize, Vec<u8>)> = reserve_rx.recv().unwrap();
-        let item = item_rx.recv().unwrap();
-        tx.send(item).unwrap();
+    let mut id = 0;
+    handle.spawn(rx.for_each(move |v: ServiceMessage| {
+      match v {
+        ServiceMessage::Put(tx, data) => {
+          tx.send(id);
+          id += 1;
+          print!("recvd data: {:?}", data.len());
+        }
       }
-    });
+      Ok(())
+    }));
 
-    BeanstalkApplication { item_tx: item_tx, reserve_tx: reserve_tx }
+    BeanstalkServiceFactory { tx: tx }
   }
 }
 
-impl NewService for BeanstalkApplication {
-  type Request = (usize, BeanstalkCommand);
+impl NewService for BeanstalkServiceFactory {
+  type Request = BeanstalkRequest;
   type Response = BeanstalkReply;
   type Error = io::Error;
-  type Instance = Log<BeanstalkService>;
+  type Instance = BeanstalkService;
 
   fn new_service(&self) -> io::Result<Self::Instance> {
-    Ok(Log::new(BeanstalkService::new(self.item_tx.clone(), self.reserve_tx.clone())))
+    Ok(BeanstalkService { tx: self.tx.clone() })
   }
 }
 
 pub fn serve(addr: SocketAddr) {
   let mut server = TcpServer::new(BeanstalkProtocol::new(), addr);
   server.threads(10);
-  server.serve(BeanstalkApplication::new());
+  server.with_handle(BeanstalkServiceFactory::new);
 }
