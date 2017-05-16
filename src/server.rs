@@ -188,7 +188,7 @@ impl Service for BeanstalkService {
       BeanstalkCommand::Put(_priority, _delay, _ttr, _bytes, data) => {
         let (tx, rx) = oneshot::channel::<usize>();
 
-        self.tx.send(ServiceMessage::Put(tx, data))
+        (&self.tx).send(ServiceMessage::Put(tx, data))
           .into_future()
           .then(|_| future::ok(BeanstalkReply::Ok(Vec::new())))
           .boxed()
